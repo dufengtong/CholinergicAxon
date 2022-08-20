@@ -1,7 +1,183 @@
 from scipy.stats import zscore
 import numpy as np
 import scipy.stats as ss
+from scipy.interpolate import interp1d
 
+def smooth_line(inputx, inputy):
+    xx = np.linspace(inputx.min(),inputx.max(), 1000)
+    itp = interp1d(inputx,inputy, kind='linear')
+    window_size, poly_order = 301, 2
+    yy = savgol_filter(itp(xx), window_size, poly_order) # smooth
+    return xx, yy
+
+def remove_false(inputx, inputy):
+    inputy = np.array(inputy)
+    inputx = np.array(inputx)
+    valid_ind = np.where(inputy > 0)[0]
+    return inputx[valid_ind], inputy[valid_ind]
+
+def important_axons(stim_w, proportion=0.1):
+    # thresh = 0.001
+    # axons_contribution = np.mean(stim_weights[:, 45:], axis=1)
+    # axons_contribution_prelick = np.mean(prelick_weights[:, :45], axis=1)
+    # idx = np.where(axons_contribution > thresh)[0]
+    # non_idx = np.where(axons_contribution <= thresh)[0]
+    NA = stim_weights.shape[0]
+    axons_contribution = np.mean(stim_weights[:, 45:], axis=1)
+    axons_contribution_threshold = np.mean(axons_contribution) + np.std(axons_contribution)
+    w_sort = np.argsort(axons_contribution)
+    NNA = int(proportion*NA)
+    idx = w_sort[-NNA:]
+    non_idx = w_sort[:(NA-NNA)]
+#     idx = np.where(axons_contribution > axons_contribution_threshold)
+#     non_idx = np.where(axons_contribution <= axons_contribution_threshold)
+    return idx, non_idx
+
+def classifier(x, y, ratio=2/3):
+    '''
+    ratio: train:test
+    '''
+    accs = []
+    weights = []
+    # make sure each class has same number of samples
+    ind1 = np.where(y==0)[0]
+    ind2 = np.where(y==1)[0]
+    valid_amount = min(len(ind2), len(ind1))
+    if valid_amount < 10:
+        print('no avalible binary labels for classifier')
+        return False, False
+    valid_ind1 = ind1[np.random.choice(np.arange(len(ind1)), valid_amount, replace=False)]
+    valid_ind2 = ind2[np.random.choice(np.arange(len(ind2)), valid_amount, replace=False)]
+    valid_ind = np.hstack([valid_ind1, valid_ind2])
+    print('valid samples: {}'.format(len(valid_ind)))
+    x = x[valid_ind]
+    y = y[valid_ind]
+    N = len(x) # number of samples
+    F = x.shape[1] # number of features
+    for seed in range(10):
+        random.seed(seed)
+        np.random.seed(seed)
+        itrain = np.random.choice(np.arange(N), size=int(N*ratio), replace=False)
+        itest = np.setxor1d(np.arange(N), itrain)
+        ylabel = y[itrain]
+        new_seed = 1000
+        while (np.sum(ylabel[0] == ylabel) == len(ylabel)):
+            new_seed +=1
+            random.seed(seed+new_seed)
+            np.random.seed(seed+new_seed)
+            itrain = np.random.choice(np.arange(N), size=int(N*ratio), replace=False)
+            itest = np.setxor1d(np.arange(N), itrain)
+            ylabel = y[itrain]
+            if new_seed >= 1050:
+                print('no avalible binary labels for classifier')
+                return False, False
+
+        model = LogisticRegression(solver='liblinear', random_state=seed)
+        model.fit(x[itrain], y[itrain])
+        te_pred = model.predict(x[itest])
+        acc = np.sum(te_pred == y[itest]) / len(itest)
+        cur_weights = model.coef_
+        accs.append(acc)
+        weights.append(cur_weights)
+    avg_acc = np.mean(accs)
+    weights = np.mean(np.array(weights), axis=0)
+    return avg_acc, weights
+
+def behavior_performance(mouse_name, drive):
+    beh_data_path = "{}:/Jenni/{}/behavior/justbehavior".format(drive, mouse_name)
+    fnames = [_ for _ in os.listdir(beh_data_path) if _.endswith('txt')]
+
+    from tkinter import Tcl
+    fnames = Tcl().call('lsort', '-dict', fnames)
+    nBlocks = len(fnames)
+    pbRes = np.zeros((4, nBlocks))
+    rlRes = np.zeros((4, nBlocks))
+    nPB = np.zeros(nBlocks)
+    days = np.zeros(nBlocks)
+    for i in range(nBlocks):
+        tmp = fnames[i].split('_')[-1]
+        days[i] = int(tmp.split('v')[0])
+        fpath = os.path.join(beh_data_path, fnames[i])
+        bmat = load_behavior_txt(fpath)
+        behavior = bmat[:, 12].reshape(-1).astype(int)
+        outcome = bmat[:, 3].reshape(-1).astype(int)
+        nPB[i] = np.sum(behavior==0)
+        if nPB[i] > 0:
+            pbIdx = np.where(behavior==0)
+            pbOutcome = outcome[pbIdx]
+            for j in range(4):
+                pbRes[j, i] = np.sum(pbOutcome == j+1) / nPB[i]
+
+        rlIdx = np.where(behavior==1)
+        rlOutcome = outcome[rlIdx]
+        for j in range(4):
+            rlRes[j, i] = np.sum(rlOutcome == j+1) / (100 - nPB[i])
+    days = days.astype('int')
+    x = np.arange(nBlocks)
+    ptrue = pbRes[0] + pbRes[3]
+    rtrue = rlRes[0] + rlRes[3]
+    return ptrue, rtrue, fnames
+
+def plot_weight(day_groups, valid_days, weights, accs, title='', smooth=False, figname=False):
+    plt.rcParams['font.size'] = 12
+    plt.rcParams['legend.fontsize'] = 8
+    cmap = plt.cm.get_cmap('viridis_r')
+
+    plt.figure(figsize=(6, 4))
+    for i, days in enumerate(day_groups):
+        wsum = 0
+        ndays = 0
+        for d in days:
+            idx = np.where(np.array(valid_days) == d)[0][0]
+            # weight = hf_weights[idx]
+            weight = np.abs(weights[idx])
+            if accs[idx]:
+                ndays +=1
+                # wsum += np.mean(weight, axis=0)
+                wsum += (np.mean(weight, axis=0) - np.mean(weight))
+        wavg = wsum/ndays
+        if smooth:
+            xx, yy = smooth_line(np.arange(len(wavg)), wavg)
+            plt.plot(xx, yy, label='period {}'.format(i), color=cmap(i/len(day_groups)))
+        else:
+            plt.plot(np.arange(len(wavg)), wavg, label='period {}'.format(i), color=cmap(i/len(day_groups)))
+        # plt.axvline(45, color='gray', linestyle=":", alpha=0.5)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('frame')
+    plt.ylabel('avearge weight')
+    if figname:
+        plt.savefig(figname)
+        # plt.close()
+        
+def plot_avg_weight(day_groups, valid_days, weights, accs, title='', smooth=False, figname=False):
+    plt.rcParams['font.size'] = 12
+    plt.rcParams['legend.fontsize'] = 8
+    cmap = plt.cm.get_cmap('viridis_r')
+
+    plt.figure(figsize=(6, 4))
+    for i, days in enumerate(day_groups):
+        wsum = 0
+        ndays = 0
+        for d in days:
+            idx = np.where(np.array(valid_days) == d)[0][0]
+            if accs[idx]:
+                ndays +=1
+                wsum += weights[idx].squeeze()
+        wavg = wsum/ndays
+        if smooth:
+            xx, yy = smooth_line(np.arange(len(wavg)), wavg)
+            plt.plot(xx, yy, label='period {}'.format(i), color=cmap(i/len(day_groups)))
+        else:
+            plt.plot(np.arange(len(wavg)), wavg, label='period {}'.format(i), color=cmap(i/len(day_groups)))
+        # plt.axvline(45, color='gray', linestyle=":", alpha=0.5)
+    plt.legend()
+    plt.title(title)
+    plt.xlabel('frame')
+    plt.ylabel('avearge weight')
+    if figname:
+        plt.savefig(figname)
+        # plt.close()
 
 def load_behavior_txt(fpath):
     res = np.zeros((100, 13))
